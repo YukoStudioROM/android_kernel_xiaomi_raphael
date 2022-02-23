@@ -1,4 +1,5 @@
 /* Copyright (c) 2018-2020, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2021 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -326,6 +327,7 @@ struct fg_gen4_chip {
 	bool			vbatt_low;
 	bool			soc_scale_mode;
 	bool			chg_term_good;
+	bool			cold_thermal_support;
 };
 
 struct bias_config {
@@ -4234,6 +4236,67 @@ out:
 	pm_relax(fg->dev);
 }
 
+#define NORMAL_VOLTAGE_UV_THR			3700000
+static int fg_get_cold_thermal_level(struct fg_dev *fg)
+{
+	union power_supply_propval pval = {0, };
+	int curr_ua, i, rc, temp, volt, status;
+
+	if (!fg)
+		return -EINVAL;
+
+	if (!fg->cold_thermal_len)
+		return 1;
+
+	if (!fg->batt_psy) {
+		fg->batt_psy = power_supply_get_by_name("battery");
+		if (!fg->batt_psy) {
+			return 1;
+		}
+	}
+
+	rc = power_supply_get_property(fg->batt_psy,
+				POWER_SUPPLY_PROP_STATUS, &pval);
+	if (rc < 0) {
+		pr_err("failed get batt staus\n");
+		return -EINVAL;
+	}
+	status = pval.intval;
+
+	rc = fg_get_battery_voltage(fg, &volt);
+	if (rc < 0)
+		pr_err("failed to get voltage, rc=%d\n", rc);
+
+	rc = fg_gen4_get_battery_temp(fg, &temp);
+	if (rc < 0)
+		pr_err("Error in getting batt_temp, rc=%d\n", rc);
+
+	if (status == POWER_SUPPLY_STATUS_CHARGING ||
+			!fg->batt_temp_low || volt > NORMAL_VOLTAGE_UV_THR)
+		return 1;
+
+	rc = fg_get_battery_current(fg, &curr_ua);
+	if (rc < 0)
+		pr_err("failded to get battery current, rc=%d\n", rc);
+
+	pr_err("volt: %d, temp: %d, curr_ua: %d\n",
+				volt, temp, curr_ua);
+
+	for (i = 0; i < fg->cold_thermal_len; i++) {
+		if (temp > fg->cold_thermal_seq[i].temp_l &&
+				temp <= fg->cold_thermal_seq[i].temp_h &&
+				curr_ua > fg->cold_thermal_seq[i].curr_th) {
+			pr_err("cold thermal trigger status:%d, temp:%d, volt:%d\n",
+					status, temp, volt);
+			pr_err("curr_ua:%d, fg->cold_thermal_seq[i].index:%d\n", curr_ua,
+					fg->cold_thermal_seq[i].index);
+			return (fg->cold_thermal_seq[i].index + 1);
+		}
+	}
+
+	return 1;
+}
+
 static void sram_dump_work(struct work_struct *work)
 {
 	struct fg_dev *fg = container_of(work, struct fg_dev,
@@ -4547,6 +4610,13 @@ static int fg_psy_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CC_STEP_SEL:
 		pval->intval = chip->ttf->cc_step.sel;
 		break;
+	case POWER_SUPPLY_PROP_COLD_THERMAL_LEVEL:
+		if(chip->cold_thermal_support) {
+			pval->intval = fg_get_cold_thermal_level(fg);
+			if (pval->intval < fg->curr_cold_thermal_level)
+				pval->intval = fg->curr_cold_thermal_level;
+		}
+		break;
 	case POWER_SUPPLY_PROP_BATT_AGE_LEVEL:
 		pval->intval = chip->batt_age_level;
 		break;
@@ -4662,6 +4732,15 @@ static int fg_psy_set_property(struct power_supply *psy,
 			rc = fg_set_constant_chg_voltage(fg, pval->intval);
 		fg->vbatt_full_volt_uv = pval->intval;
 		break;
+	case POWER_SUPPLY_PROP_COLD_THERMAL_LEVEL:
+		if (chip->cold_thermal_support) {
+			fg->curr_cold_thermal_level = pval->intval;
+			if (fg->curr_cold_thermal_level > 3)
+				fg->curr_cold_thermal_level = 3;
+			else if (fg->curr_cold_thermal_level < 1)
+				fg->curr_cold_thermal_level = 1;
+		}
+		break;
 	case POWER_SUPPLY_PROP_CALIBRATE:
 		rc = fg_gen4_set_calibrate_level(chip, pval->intval);
 		break;
@@ -4686,6 +4765,7 @@ static int fg_property_is_writeable(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CLEAR_SOH:
 	case POWER_SUPPLY_PROP_BATT_AGE_LEVEL:
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE:
+	case POWER_SUPPLY_PROP_COLD_THERMAL_LEVEL:
 	case POWER_SUPPLY_PROP_CALIBRATE:
 		return 1;
 	default:
@@ -4730,6 +4810,7 @@ static enum power_supply_property fg_psy_props[] = {
 	POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG,
 	POWER_SUPPLY_PROP_CC_STEP,
 	POWER_SUPPLY_PROP_CC_STEP_SEL,
+	POWER_SUPPLY_PROP_COLD_THERMAL_LEVEL,
 	POWER_SUPPLY_PROP_BATT_AGE_LEVEL,
 	POWER_SUPPLY_PROP_POWER_NOW,
 	POWER_SUPPLY_PROP_POWER_AVG,
@@ -5733,6 +5814,7 @@ static int fg_gen4_parse_dt(struct fg_gen4_chip *chip)
 	u32 base, temp;
 	u8 subtype;
 	int rc;
+	int size;
 
 	if (!node)  {
 		dev_err(fg->dev, "device tree node missing\n");
@@ -6052,6 +6134,32 @@ static int fg_gen4_parse_dt(struct fg_gen4_chip *chip)
 	chip->dt.sys_min_volt_mv = DEFAULT_SYS_MIN_VOLT_MV;
 	of_property_read_u32(node, "qcom,fg-sys-min-voltage",
 				&chip->dt.sys_min_volt_mv);
+
+	chip->cold_thermal_support = of_property_read_bool(node,
+			"qcom,cold-thermal-support");
+
+	size = 0;
+	of_get_property(node, "mi,cold_thermal_seq", &size);
+	if (size) {
+		fg->cold_thermal_seq = devm_kzalloc(fg->dev,
+				size, GFP_KERNEL);
+		if (fg->cold_thermal_seq) {
+			fg->cold_thermal_len =
+				(size / sizeof(int));
+			if (fg->cold_thermal_len % 4) {
+				pr_err("invalid cold thermal seq\n");
+				return -EINVAL;
+			}
+			of_property_read_u32_array(node,
+					"mi,cold_thermal_seq",
+					(int *)fg->cold_thermal_seq,
+					fg->cold_thermal_len);
+			fg->cold_thermal_len = fg->cold_thermal_len / 4;
+		} else {
+			pr_err("error allocating memory for cold thermal seq\n");
+		}
+	}
+
 	return 0;
 }
 
@@ -6282,6 +6390,7 @@ static int fg_gen4_probe(struct platform_device *pdev)
 	chip->esr_soh_cycle_count = -EINVAL;
 	fg->vbat_critical_low_count = 0;
 	fg->vbatt_full_volt_uv = 0;
+	fg->curr_cold_thermal_level = 1;
 	chip->calib_level = -EINVAL;
 	fg->regmap = dev_get_regmap(fg->dev->parent, NULL);
 	if (!fg->regmap) {

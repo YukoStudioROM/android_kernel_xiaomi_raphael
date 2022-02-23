@@ -1,5 +1,5 @@
 /* Copyright (c) 2016-2019, The Linux Foundation. All rights reserved.
- * Copyright (C) 2019 XiaoMi, Inc.
+ * Copyright (C) 2021 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -440,6 +440,13 @@ struct fg_memif {
 	u8			num_bytes_per_word;
 };
 
+struct cold_thermal {
+	int index;
+	int temp_l;
+	int temp_h;
+	int curr_th;
+};
+
 struct fg_dev {
 	struct thermal_zone_device	*tz_dev;
 	struct device		*dev;
@@ -509,6 +516,11 @@ struct fg_dev {
 	bool			qnovo_enable;
 	bool			empty_restart_fg;
 	bool			input_present;
+	bool			batt_temp_low;
+	/* cold thermal related */
+	struct cold_thermal *cold_thermal_seq;
+	int			cold_thermal_len;
+	int			curr_cold_thermal_level;
 	enum fg_version		version;
 	bool			suspended;
 	struct completion	soc_update;
